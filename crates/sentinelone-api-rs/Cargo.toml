@@ -1,0 +1,18 @@
+[package]
+name = "sentinelone-api-rs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Low-level async client for the SentinelOne Management API (ApiToken, REST)."
+
+[lib]
+name = "sentinelone_api"
+path = "src/lib.rs"
+
+[dependencies]
+sentinelone-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_urlencoded = { workspace = true }
+thiserror = { workspace = true }

@@ -1,0 +1,23 @@
+# Rust build output
+/target
+**/target
+
+# Secrets — never commit. Keep the example template tracked.
+.env
+*.env
+!.env.example
+
+# Local agent/session state
+.claude/
+**/scratchpad/
+
+# Vendor SDK (SentinelOne "Corporate IP") — excluded from this clean-room repo
+sentinel-mgmt-sdk/
+sentinel-mgmt-sdk.tar.gz
+
+# Vendor API spec + its generated reference (proprietary; build aids only)
+swagger_2_1.json
+docs/
+
+# misc
+*.log

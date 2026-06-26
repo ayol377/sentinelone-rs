@@ -1,0 +1,19 @@
+[package]
+name = "sentinelone-rs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Ergonomic high-level SDK for SentinelOne — unifies Management + XDR/Data Lake."
+
+[lib]
+name = "sentinelone"
+path = "src/lib.rs"
+
+[dependencies]
+sentinelone-api-rs = { workspace = true }
+sentinelone-xdr-api-rs = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

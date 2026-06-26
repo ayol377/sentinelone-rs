@@ -1,0 +1,30 @@
+# Run the SentinelOne MCP server as an HTTP service. Run from the repo root:
+#
+#   cp .env.example .env       # then fill in tenants + tokens
+#   docker compose up --build
+#
+# Tenants and secrets come from .env (env_file below) — never baked into the image.
+
+services:
+  sentinelone-mcp:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: sentinelone-mcp:0.1.0
+    container_name: sentinelone-mcp
+    # All tenant config + tokens are read from this file.
+    env_file:
+      - .env
+    environment:
+      # Container runs the HTTP transport regardless of what .env says.
+      MCP_TRANSPORT: http
+      MCP_BIND: 0.0.0.0:8080
+    ports:
+      - "8080:8080"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s

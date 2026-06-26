@@ -1,0 +1,123 @@
+//! Models for the `Inventory Endpoint Surface Filters` tag.
+//!
+//! Inventory Endpoint Surface Resource Filters.
+//!
+//! All fields are `Option<T>` because none of the underlying spec definitions
+//! declare a `required` array (so every property defaults to nullable).
+
+use serde::Deserialize;
+
+/// A single filter, returned by the filter-counts endpoint, holding the list
+/// of values available for that filter together with their match counts.
+///
+/// Spec definition: `CountFiltersResponse`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CountFiltersResponse {
+    /// A list of filter values with their count.
+    ///
+    /// Optional / nullable.
+    pub values: Option<Vec<FilterCountValue>>,
+    /// A flag to disable the UI filter values sorting by counts, and instead
+    /// display values in the provided order.
+    ///
+    /// Optional / nullable.
+    pub disable_sorting: Option<bool>,
+    /// Filter argument key.
+    ///
+    /// Optional / nullable.
+    pub key: Option<String>,
+    /// Filter description.
+    ///
+    /// Optional / nullable.
+    pub title: Option<String>,
+    /// This flag indicates whether the negation query is enabled for this
+    /// filter key or not.
+    ///
+    /// Optional / nullable.
+    pub enable_negation: Option<bool>,
+}
+
+/// A single filter value together with the number of entities matching it.
+///
+/// Spec definition: `FilterCountValue`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FilterCountValue {
+    /// Value description.
+    ///
+    /// Optional / nullable.
+    pub title: Option<String>,
+    /// Value.
+    ///
+    /// Optional / nullable.
+    pub value: Option<String>,
+    /// Number of entities matching this value.
+    ///
+    /// Optional / nullable.
+    pub count: Option<i64>,
+}
+
+/// A free-text filter descriptor, returned by the free-text filters endpoint.
+///
+/// Spec definition: `FreeTextFilterResponse`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FreeTextFilterResponse {
+    /// A regular expression for values validation.
+    ///
+    /// Optional / nullable.
+    pub validation: Option<String>,
+    /// Filter argument key (e.g. `computerName__contains`).
+    ///
+    /// Optional / nullable.
+    pub key: Option<String>,
+    /// Filter icon (e.g. `upload`).
+    ///
+    /// Optional / nullable.
+    pub icon: Option<String>,
+    /// Filter description (e.g. `Computer name`).
+    ///
+    /// Optional / nullable.
+    pub title: Option<String>,
+    /// API path for auto-complete query (if applicable).
+    ///
+    /// Optional / nullable.
+    pub auto_complete: Option<String>,
+}
+
+/// The auto-complete suggestions for a single filter field.
+///
+/// Spec definition: `AutoCompleteResponse`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoCompleteResponse {
+    /// Filter description (e.g. `Computer name`).
+    ///
+    /// Optional / nullable.
+    pub title: Option<String>,
+    /// Auto complete values.
+    ///
+    /// Optional / nullable.
+    pub values: Option<Vec<AutoCompleteValue>>,
+    /// Filter argument key (e.g. `computerName__contains`).
+    ///
+    /// Optional / nullable.
+    pub key: Option<String>,
+}
+
+/// A single auto-complete suggestion value with its occurrence count.
+///
+/// Spec definition: `Values`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AutoCompleteValue {
+    /// Value (e.g. `JohnD_WORKSTATION`).
+    ///
+    /// Optional / nullable.
+    pub value: Option<String>,
+    /// Number of occurrences (e.g. `51`).
+    ///
+    /// Optional / nullable.
+    pub count: Option<i64>,
+}

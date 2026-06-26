@@ -1,0 +1,17 @@
+[package]
+name = "sentinelone-xdr-api-rs"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Low-level async client for the SentinelOne XDR / Singularity Data Lake (DataSet) API (Bearer)."
+
+[lib]
+name = "sentinelone_xdr_api"
+path = "src/lib.rs"
+
+[dependencies]
+sentinelone-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
