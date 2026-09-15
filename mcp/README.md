@@ -37,16 +37,24 @@ so nothing MCP-specific has to live at the repo root.
 A release build of the 826-endpoint `sentinelone-api-rs` crate needs about
 3 GB of RAM in a single `rustc` process (measured; `codegen-units`, `opt-level`
 and `-j` move it by under 10%). On a host with less, Docker kills the build
-(`signal: 9, SIGKILL`). Build the image where the memory is and ship it —
-`docker compose up` without `--build` uses the local `sentinelone-mcp:0.1.0`
-image as-is:
+(`signal: 9, SIGKILL`). Build where the memory is and ship the result.
+
+**Option A — static binary (simplest, no Docker on the server):**
 
 ```bash
-# on a machine with RAM, from mcp/:
-docker compose build
+./build-static.sh                      # from mcp/; static musl binary, runs on any x86_64 Linux
+scp ../target/musl/release/sentinelone-mcp SERVER:/usr/local/bin/
+# on SERVER, with mcp/.env next to it (or MCP_ENV_FILE=/path/.env):
+MCP_TRANSPORT=http sentinelone-mcp     # add a systemd unit to keep it running
+```
+
+**Option B — prebuilt image:**
+
+```bash
+docker compose build                   # from mcp/, on a machine with RAM
 docker save sentinelone-mcp:0.1.0 | gzip | ssh SERVER 'gunzip | docker load'
 # on SERVER, from mcp/ (with its own .env):
-docker compose up -d
+docker compose up -d                   # no --build
 ```
 
 ## Configuration (env / `.env`)
