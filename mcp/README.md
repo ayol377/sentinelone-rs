@@ -37,16 +37,24 @@ so nothing MCP-specific has to live at the repo root.
 A release build of the 826-endpoint `sentinelone-api-rs` crate needs about
 3 GB of RAM in a single `rustc` process (measured; `codegen-units`, `opt-level`
 and `-j` move it by under 10%). On a host with less, Docker kills the build
-(`signal: 9, SIGKILL`). Build the image where the memory is and ship it —
-`docker compose up` without `--build` uses the local `sentinelone-mcp:0.1.0`
-image as-is:
+(`signal: 9, SIGKILL`). Build where the memory is and ship the result.
+
+**Option A — static binary (simplest, no Docker on the server):**
 
 ```bash
-# on a machine with RAM, from mcp/:
-docker compose build
+./build-static.sh                      # from mcp/; static musl binary, runs on any x86_64 Linux
+scp ../target/musl/release/sentinelone-mcp SERVER:/usr/local/bin/
+# on SERVER, with mcp/.env next to it (or MCP_ENV_FILE=/path/.env):
+MCP_TRANSPORT=http sentinelone-mcp     # add a systemd unit to keep it running
+```
+
+**Option B — prebuilt image:**
+
+```bash
+docker compose build                   # from mcp/, on a machine with RAM
 docker save sentinelone-mcp:0.1.0 | gzip | ssh SERVER 'gunzip | docker load'
 # on SERVER, from mcp/ (with its own .env):
-docker compose up -d
+docker compose up -d                   # no --build
 ```
 
 ## Configuration (env / `.env`)
@@ -187,7 +195,7 @@ segments.
   confined and unconfined tenants' results in one response, each tagged with its
   `tenant`.
 
-## Tools (42)
+## Tools (43)
 
 Every read tool takes the common params `tenant`, `query`, `limit`, `cursor`,
 `sort_by`, `sort_order`, and a **`filters`** object accepting any API query param
@@ -225,7 +233,8 @@ to the convenience aliases below.
 **Hunting (XDR / Data Lake)**
 | Tool | Purpose |
 |------|---------|
-| `s1_power_query` | arbitrary PQL hunt |
+| `s1_dv_power_query` | PQL via the Management console (`/dv/events/pq`); honours multi-account tokens, optional `account_ids`/`site_ids`. **Use this on multi-account consoles** |
+| `s1_power_query` | PQL via the XDR host. Fast, but on a multi-account console it can return zero rows with no error |
 | `s1_query` | DataSet log/event filter query |
 | `s1_facet`, `s1_numeric`, `s1_timeseries` | aggregate / trend / spike |
 

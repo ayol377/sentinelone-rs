@@ -17,5 +17,5 @@ serde_json = { workspace = true }
 serde_urlencoded = { workspace = true }
 futures = { workspace = true }
 thiserror = { workspace = true }
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-std", "io-util", "signal"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-std", "io-util", "signal", "time"] }
 axum = "0.8"
