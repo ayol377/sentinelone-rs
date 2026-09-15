@@ -1,6 +1,10 @@
-# Builds the sentinelone-mcp server. Context = repo root (workspace).
+# Builds the sentinelone-mcp server. Build context = workspace root (path deps),
+# so from the repo root:
 #
-#   docker build -t sentinelone-mcp .
+#   docker build -f mcp/Dockerfile -t sentinelone-mcp .
+#
+# or, from mcp/: `docker compose up --build` (see docker-compose.yml).
+# Ignore rules: mcp/Dockerfile.dockerignore (BuildKit <Dockerfile>.dockerignore).
 
 FROM rust:1-bookworm AS builder
 WORKDIR /build

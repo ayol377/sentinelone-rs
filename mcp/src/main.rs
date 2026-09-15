@@ -9,6 +9,7 @@ mod config;
 mod http;
 mod mcp;
 mod registry;
+mod scope;
 mod stdio;
 mod tools;
 
@@ -35,6 +36,32 @@ async fn run() -> Result<(), String> {
         registry.all().len(),
         if settings.allow_actions { "ENABLED" } else { "disabled" },
     );
+    // Confinement is a security property an operator must be able to see
+    // without reading the config, so report it per tenant at startup.
+    for t in registry.all() {
+        let cfg = &t.cfg;
+        eprintln!(
+            "  tenant {:<16} {}{}",
+            cfg.id,
+            crate::scope::describe(cfg),
+            if cfg.is_scoped() {
+                let mut extra = Vec::new();
+                if cfg.unsafe_allow_xdr {
+                    extra.push("UNSAFE_ALLOW_XDR");
+                }
+                if cfg.unsafe_allow_raw_get {
+                    extra.push("UNSAFE_ALLOW_RAW_GET");
+                }
+                if extra.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", extra.join(", "))
+                }
+            } else {
+                String::new()
+            },
+        );
+    }
 
     let transport = settings.transport;
     let bind = settings.bind.clone();
