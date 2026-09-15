@@ -1,15 +1,18 @@
-# Run the SentinelOne MCP server as an HTTP service. Run from the repo root:
+# Run the SentinelOne MCP server as an HTTP service. Run from this directory (mcp/):
 #
 #   cp .env.example .env       # then fill in tenants + tokens
 #   docker compose up --build
 #
-# Tenants and secrets come from .env (env_file below) — never baked into the image.
+# Build context is the workspace root (..) because this crate depends on the SDK
+# crates by path. Dockerfile.dockerignore (next to the Dockerfile) keeps that
+# context small. Tenants and secrets come from mcp/.env (env_file below) — never
+# baked into the image.
 
 services:
   sentinelone-mcp:
     build:
-      context: .
-      dockerfile: Dockerfile
+      context: ..
+      dockerfile: mcp/Dockerfile
     image: sentinelone-mcp:0.1.0
     container_name: sentinelone-mcp
     # All tenant config + tokens are read from this file.

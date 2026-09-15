@@ -11,7 +11,7 @@ name = "sentinelone-mcp"
 path = "src/main.rs"
 
 [dependencies]
-sentinelone-rs = { path = "../sentinelone-rs" }
+sentinelone-rs = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_urlencoded = { workspace = true }

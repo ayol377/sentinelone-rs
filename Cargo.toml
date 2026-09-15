@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/*"]
+members = ["crates/*", "mcp"]
 
 [workspace.package]
 edition = "2024"
@@ -23,6 +23,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 sentinelone-http = { path = "crates/sentinelone-http" }
 sentinelone-api-rs = { path = "crates/sentinelone-api-rs" }
 sentinelone-xdr-api-rs = { path = "crates/sentinelone-xdr-api-rs" }
+sentinelone-rs = { path = "crates/sentinelone-rs" }
 
 [profile.release]
 lto = "thin"

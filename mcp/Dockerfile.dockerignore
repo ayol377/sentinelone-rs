@@ -1,0 +1,12 @@
+# Ignore rules for mcp/Dockerfile (BuildKit picks up <Dockerfile>.dockerignore
+# next to the Dockerfile). Build context = workspace root; keep it small and
+# free of secrets. Paths are relative to the context root.
+target/
+**/target/
+**/.env
+.git/
+*.log
+# large local references not needed to build the MCP server
+sentinel-mgmt-sdk/
+swagger_2_1.json
+docs/

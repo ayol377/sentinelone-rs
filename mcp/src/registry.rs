@@ -24,7 +24,6 @@ impl Tenant {
 /// All tenants, keyed for selection by id / name / group / `"*"`.
 pub struct Registry {
     tenants: Vec<Tenant>,
-    default: Option<String>,
 }
 
 impl Registry {
@@ -45,46 +44,23 @@ impl Registry {
             tenants.push(Tenant { cfg: cfg.clone(), client });
         }
 
-        // Default: explicit, or the sole tenant when there is exactly one.
-        let default = settings.default_tenant.clone().or_else(|| {
-            if tenants.len() == 1 {
-                Some(tenants[0].cfg.id.clone())
-            } else {
-                None
-            }
-        });
-
-        Ok(Registry { tenants, default })
+        Ok(Registry { tenants })
     }
 
     pub fn all(&self) -> &[Tenant] {
         &self.tenants
     }
 
-    fn get(&self, id: &str) -> Option<&Tenant> {
-        self.tenants.iter().find(|t| t.cfg.id == id)
-    }
-
     /// Resolve a `tenant` selector to one or more tenants.
     ///
-    /// - `None` → the session/config default (error if ambiguous);
-    /// - `"*"` / `"all"` → every tenant (fan-out);
+    /// - omitted / `""` / `"*"` / `"all"` → every tenant (fan-out) — the default,
+    ///   so a lookup with no `tenant` searches every console the server holds
+    ///   credentials for, each confined to its own scope;
     /// - an exact id or name → that one;
     /// - otherwise, every tenant carrying the value as a group label (fan-out).
     pub fn resolve(&self, selector: Option<&str>) -> Result<Vec<&Tenant>, String> {
         match selector.map(str::trim) {
-            None | Some("") => {
-                let def = self.default.as_deref().ok_or_else(|| {
-                    "multiple tenants configured; specify `tenant` (id, name, group, or \"*\") \
-                     or set S1_DEFAULT_TENANT"
-                        .to_string()
-                })?;
-                let t = self
-                    .get(def)
-                    .ok_or_else(|| format!("default tenant {def} not found"))?;
-                Ok(vec![t])
-            }
-            Some("*") | Some("all") => {
+            None | Some("") | Some("*") | Some("all") => {
                 if self.tenants.is_empty() {
                     return Err("no tenants configured".into());
                 }

@@ -5,7 +5,24 @@ MCP server exposing SentinelOne to an LLM analyst agent. Built **on top of
 The server holds one configured `SentinelOne` (management + XDR), and each MCP
 tool is a thin, safety-shaped wrapper over a facade call.
 
-Status: **planning**. No Rust yet. This doc fixes the tool surface first.
+Status: **historical design plan**, written before any code (June 2026). v0.1
+shipped 2026-06-27; [`README.md`](./README.md) and `src/tools.rs` describe what
+exists. Where this doc and the code disagree, the code won. Superseded decisions:
+
+| Planned here | Shipped |
+|---|---|
+| `rmcp` SDK, stdio only | hand-rolled JSON-RPC 2.0 (`src/mcp.rs`); stdio + HTTP (axum) transports |
+| TOML tenants file + OS keychain (§2.5) | env-only config, secrets in `mcp/.env` (`src/config.rs`) |
+| `--allow-actions` + two-call preview → `confirm_token` (§7, §8.4) | `MCP_ALLOW_ACTIONS=true` + single resolved tenant + `"confirm": true` |
+| `s1_use_tenant` / `s1_add_tenant` session state (§6) | not built; `tenant` arg per call, omitted = every tenant |
+| `{field, op, value}` filter DSL + discovery tools (§3) | per-tool convenience aliases + a raw `filters` object passing any API param by wire name |
+| `s1_pivot_*`, guided hunt builders, resources/prompts (§4.3, §5, §8.5) | not built; `s1_power_query` and `s1_get_raw` / `s1_post_raw` cover the ground |
+| normalized, envelope-stripped output | raw Management JSON passthrough, fan-out tagged `{tenant, ok, data\|error}` |
+
+Still accurate: §1 (why search + pivot), the tenant-vs-scope model and fan-out
+contract in §2.5, the gating intent of §7, and the CIDR notes in §8.1 (today's
+`ip` alias is a `networkInterfaceInet__contains` prefix match, no client-side
+CIDR check yet).
 
 ---
 

@@ -12,7 +12,6 @@
 //!
 //! Tenants:
 //! - `S1_TENANTS` = comma-separated tenant ids, e.g. `acme,globex`
-//! - `S1_DEFAULT_TENANT` = id used when a tool omits `tenant` (optional if only one)
 //!
 //! Per tenant `<ID>` (id upper-cased, non-alphanumerics → `_`):
 //! - `S1_TENANT_<ID>_NAME`        (optional, display name)
@@ -21,6 +20,21 @@
 //! - `S1_TENANT_<ID>_XDR_HOST`    + `S1_TENANT_<ID>_XDR_TOKEN`
 //!
 //! A tenant may configure only mgmt, only xdr, or both.
+//!
+//! ## Confinement (MSSP tenancy)
+//!
+//! The Management API token is typically *account*-scoped: it can read every
+//! site in the account, so it cannot by itself stop one customer's investigation
+//! from reading another's data. These variables confine a tenant server-side —
+//! see [`crate::scope`]:
+//!
+//! - `S1_TENANT_<ID>_SITE_IDS`    (comma-separated site ids; empty = unrestricted)
+//! - `S1_TENANT_<ID>_ACCOUNT_IDS` (comma-separated account ids; for customers
+//!   who own a whole account rather than a site)
+//! - `S1_TENANT_<ID>_UNSAFE_ALLOW_XDR`      (opt back in to XDR/Data Lake tools
+//!   for a confined tenant — PQL/DataSet queries cannot be confined here)
+//! - `S1_TENANT_<ID>_UNSAFE_ALLOW_RAW_GET`  (opt back in to `s1_get_raw` for a
+//!   confined tenant — best-effort scope injection only)
 
 use std::env;
 
@@ -41,6 +55,21 @@ pub struct TenantConfig {
     pub mgmt_token: Option<String>,
     pub xdr_host: Option<String>,
     pub xdr_token: Option<String>,
+    /// Site ids this tenant may see. Empty = unrestricted (account-wide).
+    pub site_ids: Vec<String>,
+    /// Account ids this tenant may see. Empty = unrestricted.
+    pub account_ids: Vec<String>,
+    /// Allow XDR / Data Lake tools even though this tenant is confined.
+    pub unsafe_allow_xdr: bool,
+    /// Allow `s1_get_raw` even though this tenant is confined.
+    pub unsafe_allow_raw_get: bool,
+}
+
+impl TenantConfig {
+    /// True when this tenant is confined to a subset of the console.
+    pub fn is_scoped(&self) -> bool {
+        !self.site_ids.is_empty() || !self.account_ids.is_empty()
+    }
 }
 
 /// Full server settings.
@@ -49,7 +78,6 @@ pub struct Settings {
     pub transport: Transport,
     pub bind: String,
     pub allow_actions: bool,
-    pub default_tenant: Option<String>,
     pub tenants: Vec<TenantConfig>,
 }
 
@@ -66,7 +94,6 @@ impl Settings {
         };
         let bind = env::var("MCP_BIND").unwrap_or_else(|_| "0.0.0.0:8080".into());
         let allow_actions = env_bool("MCP_ALLOW_ACTIONS");
-        let default_tenant = env::var("S1_DEFAULT_TENANT").ok().filter(|s| !s.is_empty());
 
         let ids: Vec<String> = env::var("S1_TENANTS")
             .unwrap_or_default()
@@ -97,12 +124,19 @@ impl Settings {
             }
 
             let name = tenant_var(&key, "NAME").unwrap_or_else(|| id.clone());
-            let groups = tenant_var(&key, "GROUPS")
-                .unwrap_or_default()
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
+            let groups = csv_var(&key, "GROUPS");
+
+            let site_ids = csv_var(&key, "SITE_IDS");
+            let account_ids = csv_var(&key, "ACCOUNT_IDS");
+            for v in site_ids.iter().chain(account_ids.iter()) {
+                if !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+                    return Err(format!(
+                        "tenant {id}: invalid scope id {v:?} (expected an id like 225494730938493804)"
+                    ));
+                }
+            }
+            let unsafe_allow_xdr = env_bool(&format!("S1_TENANT_{key}_UNSAFE_ALLOW_XDR"));
+            let unsafe_allow_raw_get = env_bool(&format!("S1_TENANT_{key}_UNSAFE_ALLOW_RAW_GET"));
 
             tenants.push(TenantConfig {
                 id,
@@ -112,16 +146,14 @@ impl Settings {
                 mgmt_token,
                 xdr_host,
                 xdr_token,
+                site_ids,
+                account_ids,
+                unsafe_allow_xdr,
+                unsafe_allow_raw_get,
             });
         }
 
-        if let Some(def) = &default_tenant {
-            if !tenants.iter().any(|t| &t.id == def) {
-                return Err(format!("S1_DEFAULT_TENANT={def} is not in S1_TENANTS"));
-            }
-        }
-
-        Ok(Settings { transport, bind, allow_actions, default_tenant, tenants })
+        Ok(Settings { transport, bind, allow_actions, tenants })
     }
 }
 
@@ -133,6 +165,16 @@ fn env_key(id: &str) -> String {
 
 fn tenant_var(key: &str, suffix: &str) -> Option<String> {
     env::var(format!("S1_TENANT_{key}_{suffix}")).ok().filter(|s| !s.is_empty())
+}
+
+/// A comma-separated tenant variable, trimmed, empties dropped.
+fn csv_var(key: &str, suffix: &str) -> Vec<String> {
+    tenant_var(key, suffix)
+        .unwrap_or_default()
+        .split(',')
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .collect()
 }
 
 fn env_bool(name: &str) -> bool {

@@ -8,6 +8,16 @@
 //! wire name. Two escape hatches — `s1_get_raw` / `s1_post_raw` — guarantee that
 //! *any* of the 826 Management endpoints is reachable even if no curated tool
 //! wraps it.
+//!
+//! ## Confinement
+//!
+//! Every Management `GET` in this module goes through [`do_get_json`], which
+//! calls [`scope::apply`] — the single place a querystring is built. A tenant
+//! configured with `S1_TENANT_<ID>_SITE_IDS` therefore cannot have an
+//! out-of-scope request constructed for it, no matter what the caller passes.
+//! Targets named in a *path* (threat sub-resources) or in a POST body (actions)
+//! are confined instead by resolving the id through a confined read first and
+//! refusing when it does not come back.
 
 use futures::future::join_all;
 use serde_json::{json, Map, Value};
@@ -16,9 +26,10 @@ use sentinelone::xdr_api::{FacetQueryRequest, TimeseriesQuerySpec};
 
 use crate::mcp::ServerState;
 use crate::registry::Tenant;
+use crate::scope;
 
 const TENANT_HELP: &str =
-    "Tenant selector: id, name, group label, or \"*\" for all (fan-out). Omit for the default.";
+    "Tenant selector: id, name, group label, or \"*\" for all (fan-out). Omit to run against every tenant.";
 
 // ---- table-driven read tools --------------------------------------------
 
@@ -89,6 +100,30 @@ const LIST_TOOLS: &[ListTool] = &[
 
 // ---- table-driven action tools (gated) ----------------------------------
 
+/// What kind of entity an action targets — used to confine it by resolving the
+/// target ids through a scoped read before acting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Target {
+    Agent,
+    Threat,
+}
+
+impl Target {
+    /// The scoped list endpoint used to prove a target id is in scope.
+    fn list_path(self) -> &'static str {
+        match self {
+            Target::Agent => "/web/api/v2.1/agents",
+            Target::Threat => "/web/api/v2.1/threats",
+        }
+    }
+    fn noun(self) -> &'static str {
+        match self {
+            Target::Agent => "agent",
+            Target::Threat => "threat",
+        }
+    }
+}
+
 /// A destructive/mutating tool backed by a raw Management `POST`.
 struct ActionTool {
     name: &'static str,
@@ -99,20 +134,22 @@ struct ActionTool {
     data: &'static [(&'static str, &'static str, &'static str)],
     /// (arg name, description) for a `{action}` path segment, if any.
     path_param: Option<(&'static str, &'static str)>,
+    /// Entity kind the `ids` refer to, so confinement can verify them.
+    target: Target,
 }
 
 const ACTION_TOOLS: &[ActionTool] = &[
-    ActionTool { name: "s1_isolate_device", desc: "Network-isolate (disconnect) agent(s).", path: "/web/api/v2.1/agents/actions/disconnect", data: &[], path_param: None },
-    ActionTool { name: "s1_reconnect_device", desc: "Reconnect previously isolated agent(s).", path: "/web/api/v2.1/agents/actions/connect", data: &[], path_param: None },
-    ActionTool { name: "s1_scan_device", desc: "Start a full disk scan on agent(s).", path: "/web/api/v2.1/agents/actions/initiate-scan", data: &[], path_param: None },
-    ActionTool { name: "s1_reboot_device", desc: "Reboot agent machine(s).", path: "/web/api/v2.1/agents/actions/restart-machine", data: &[], path_param: None },
-    ActionTool { name: "s1_move_device_to_site", desc: "Move agent(s) to another site.", path: "/web/api/v2.1/agents/actions/move-to-site", data: &[("site_id", "targetSiteId", "Destination site id")], path_param: None },
-    ActionTool { name: "s1_mitigate_threat", desc: "Mitigate threat(s) with the given action.", path: "/web/api/v2.1/threats/mitigate/{action}", data: &[], path_param: Some(("action", "One of: kill, quarantine, un-quarantine, remediate, rollback-remediation, network-quarantine")) },
-    ActionTool { name: "s1_add_threat_note", desc: "Add a note to threat(s).", path: "/web/api/v2.1/threats/notes", data: &[("text", "text", "Note text")], path_param: None },
-    ActionTool { name: "s1_set_threat_verdict", desc: "Set analyst verdict on threat(s).", path: "/web/api/v2.1/threats/analyst-verdict", data: &[("verdict", "analystVerdict", "true_positive | false_positive | suspicious | undefined")], path_param: None },
-    ActionTool { name: "s1_set_threat_status", desc: "Set incident status on threat(s).", path: "/web/api/v2.1/threats/incident", data: &[("status", "incidentStatus", "unresolved | in_progress | resolved")], path_param: None },
-    ActionTool { name: "s1_add_threat_to_blocklist", desc: "Add threat(s) hash to the blocklist.", path: "/web/api/v2.1/threats/add-to-blacklist", data: &[], path_param: None },
-    ActionTool { name: "s1_run_remote_script", desc: "Run a RemoteOps script on agent(s). Provide script parameters via `data` (e.g. scriptId, taskDescription, outputDestination). Poll results with s1_remote_script_status.", path: "/web/api/v2.1/remote-scripts/execute", data: &[("script_id", "scriptId", "Id of the script to run")], path_param: None },
+    ActionTool { name: "s1_isolate_device", desc: "Network-isolate (disconnect) agent(s).", path: "/web/api/v2.1/agents/actions/disconnect", data: &[], path_param: None , target: Target::Agent },
+    ActionTool { name: "s1_reconnect_device", desc: "Reconnect previously isolated agent(s).", path: "/web/api/v2.1/agents/actions/connect", data: &[], path_param: None , target: Target::Agent },
+    ActionTool { name: "s1_scan_device", desc: "Start a full disk scan on agent(s).", path: "/web/api/v2.1/agents/actions/initiate-scan", data: &[], path_param: None , target: Target::Agent },
+    ActionTool { name: "s1_reboot_device", desc: "Reboot agent machine(s).", path: "/web/api/v2.1/agents/actions/restart-machine", data: &[], path_param: None , target: Target::Agent },
+    ActionTool { name: "s1_move_device_to_site", desc: "Move agent(s) to another site.", path: "/web/api/v2.1/agents/actions/move-to-site", data: &[("site_id", "targetSiteId", "Destination site id")], path_param: None , target: Target::Agent },
+    ActionTool { name: "s1_mitigate_threat", desc: "Mitigate threat(s) with the given action.", path: "/web/api/v2.1/threats/mitigate/{action}", data: &[], path_param: Some(("action", "One of: kill, quarantine, un-quarantine, remediate, rollback-remediation, network-quarantine")) , target: Target::Threat },
+    ActionTool { name: "s1_add_threat_note", desc: "Add a note to threat(s).", path: "/web/api/v2.1/threats/notes", data: &[("text", "text", "Note text")], path_param: None , target: Target::Threat },
+    ActionTool { name: "s1_set_threat_verdict", desc: "Set analyst verdict on threat(s).", path: "/web/api/v2.1/threats/analyst-verdict", data: &[("verdict", "analystVerdict", "true_positive | false_positive | suspicious | undefined")], path_param: None , target: Target::Threat },
+    ActionTool { name: "s1_set_threat_status", desc: "Set incident status on threat(s).", path: "/web/api/v2.1/threats/incident", data: &[("status", "incidentStatus", "unresolved | in_progress | resolved")], path_param: None , target: Target::Threat },
+    ActionTool { name: "s1_add_threat_to_blocklist", desc: "Add threat(s) hash to the blocklist.", path: "/web/api/v2.1/threats/add-to-blacklist", data: &[], path_param: None , target: Target::Threat },
+    ActionTool { name: "s1_run_remote_script", desc: "Run a RemoteOps script on agent(s). Provide script parameters via `data` (e.g. scriptId, taskDescription, outputDestination). Poll results with s1_remote_script_status.", path: "/web/api/v2.1/remote-scripts/execute", data: &[("script_id", "scriptId", "Id of the script to run")], path_param: None , target: Target::Agent },
 ];
 
 // ---- definitions ---------------------------------------------------------
@@ -124,9 +161,9 @@ pub fn definitions() -> Vec<Value> {
     let tenant_p = json!({ "type": "string", "description": TENANT_HELP });
 
     let mut tools = vec![
-        json!({ "name": "s1_list_tenants", "description": "List configured consoles and which backends (mgmt/xdr) each has.",
+        json!({ "name": "s1_list_tenants", "description": "List configured consoles, which backends (mgmt/xdr) each has, and the site scope each is confined to. Check this first: a confined tenant can only ever return data for its own sites.",
                 "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false } }),
-        json!({ "name": "s1_ping", "description": "Health check: for the selected tenant(s), report configured backends.",
+        json!({ "name": "s1_ping", "description": "Health check: for the selected tenant(s), report configured backends and site confinement.",
                 "inputSchema": { "type": "object", "properties": { "tenant": tenant_p }, "additionalProperties": false } }),
         json!({ "name": "s1_get_device", "description": "Fetch one agent by id/UUID with full fields (IPs, OS, scope, tags). Fan-out capable.",
                 "inputSchema": { "type": "object", "properties": { "tenant": tenant_p, "id": { "type": "string", "description": "Agent id or UUID." } }, "required": ["id"], "additionalProperties": false } }),
@@ -150,9 +187,9 @@ pub fn definitions() -> Vec<Value> {
         json!({ "name": "s1_timeseries", "description": "Time-bucketed counts/aggregation over XDR events (trend / spike detection).",
                 "inputSchema": { "type": "object", "properties": { "tenant": tenant_p, "filter": { "type": "string" }, "function": { "type": "string", "description": "e.g. count, mean:field" }, "from": from_p, "to": to_p, "buckets": { "type": "integer", "description": "Number of time buckets. Default 24." } }, "required": ["function"], "additionalProperties": false } }),
         // ---- raw escape hatches ----
-        json!({ "name": "s1_get_raw", "description": "Escape hatch: raw GET to ANY Management API path (reach endpoints with no curated tool). Read-only.",
+        json!({ "name": "s1_get_raw", "description": "Escape hatch: raw GET to ANY Management API path (reach endpoints with no curated tool). Read-only. Disabled for a site-confined tenant (an arbitrary path may ignore the injected siteIds filter) unless the operator opts in.",
                 "inputSchema": { "type": "object", "properties": { "tenant": tenant_p, "path": { "type": "string", "description": "API path, e.g. /web/api/v2.1/ranger/tables" }, "query": { "type": "string", "description": "Pre-serialized querystring, e.g. limit=10&osTypes=windows" } }, "required": ["path"], "additionalProperties": false } }),
-        json!({ "name": "s1_post_raw", "description": "[ACTION] Escape hatch: raw POST of a JSON body to ANY Management API path. Gated; single tenant; confirm required.",
+        json!({ "name": "s1_post_raw", "description": "[ACTION] Escape hatch: raw POST of a JSON body to ANY Management API path. Gated; single tenant; confirm required. Always refused for a site-confined tenant — use a curated action tool, which verifies its targets are in scope.",
                 "inputSchema": { "type": "object", "properties": { "tenant": tenant_p, "path": { "type": "string" }, "body": { "type": "object", "additionalProperties": true, "description": "Raw JSON request body." }, "confirm": { "type": "boolean" } }, "required": ["path"], "additionalProperties": false } }),
     ];
 
@@ -160,7 +197,7 @@ pub fn definitions() -> Vec<Value> {
         tools.push(json!({ "name": lt.name, "description": lt.desc, "inputSchema": list_schema(lt.params) }));
     }
     for at in ACTION_TOOLS {
-        tools.push(json!({ "name": at.name, "description": format!("[ACTION] {} Requires MCP_ALLOW_ACTIONS=true, a single tenant, and \"confirm\": true.", at.desc), "inputSchema": action_schema(at) }));
+        tools.push(json!({ "name": at.name, "description": format!("[ACTION] {} Requires MCP_ALLOW_ACTIONS=true, a single tenant, and \"confirm\": true. For a site-confined tenant every target id is resolved through a scoped read first and the action is refused if it belongs elsewhere.", at.desc), "inputSchema": action_schema(at) }));
     }
     tools
 }
@@ -181,7 +218,7 @@ fn list_schema(params: &[(&str, &str, &str)]) -> Value {
         "cursor": { "type": "string", "description": "Pagination cursor from a prior response." },
         "sort_by": { "type": "string", "description": "Field to sort by." },
         "sort_order": { "type": "string", "description": "asc or desc." },
-        "filters": { "type": "object", "additionalProperties": true, "description": "Any additional API query params by exact wire name, e.g. {\"osTypes\":\"windows\"}." }
+        "filters": { "type": "object", "additionalProperties": true, "description": "Any additional API query params by exact wire name, e.g. {\"osTypes\":\"windows\"}. Scope keys (siteIds/accountIds/groupIds/tenant) are stripped here and replaced by the server's configured scope." }
     });
     let m = props.as_object_mut().unwrap();
     for (arg, _p, d) in params {
@@ -261,7 +298,13 @@ fn list_tenants(state: &ServerState) -> Result<Value, String> {
         .registry
         .all()
         .iter()
-        .map(|t| json!({ "id": t.cfg.id, "name": t.cfg.name, "groups": t.cfg.groups, "backends": backends(t) }))
+        .map(|t| json!({
+            "id": t.cfg.id,
+            "name": t.cfg.name,
+            "groups": t.cfg.groups,
+            "backends": backends(t),
+            "scope": scope_report(t),
+        }))
         .collect();
     Ok(json!({ "actions_enabled": state.settings.allow_actions, "tenants": tenants }))
 }
@@ -270,7 +313,7 @@ fn ping(state: &ServerState, args: &Value) -> Result<Value, String> {
     let tenants = state.registry.resolve(str_opt(args, "tenant").as_deref())?;
     let results: Vec<Value> = tenants
         .iter()
-        .map(|t| json!({ "tenant": t.cfg.id, "ok": true, "backends": backends(t) }))
+        .map(|t| json!({ "tenant": t.cfg.id, "ok": true, "backends": backends(t), "scope": scope_report(t) }))
         .collect();
     Ok(json!({ "results": results }))
 }
@@ -291,10 +334,10 @@ async fn get_device(state: &ServerState, args: &Value) -> Result<Value, String> 
 async fn get_threat(state: &ServerState, args: &Value) -> Result<Value, String> {
     let id = req_str(args, "id")?;
     let tenants = state.registry.resolve(str_opt(args, "tenant").as_deref())?;
-    let qs = querystring(vec![("ids".into(), id)]);
-    let qsr = qs.as_deref();
+    let pairs = vec![("ids".to_string(), id)];
+    let pairs = &pairs;
     let res = join_all(tenants.into_iter().map(|t| async move {
-        (t.cfg.id.clone(), do_get_json(t, "/web/api/v2.1/threats", qsr).await)
+        (t.cfg.id.clone(), do_get_json(t, "/web/api/v2.1/threats", pairs).await)
     }))
     .await;
     Ok(fanout(res))
@@ -310,12 +353,16 @@ async fn threat_sub(state: &ServerState, args: &Value, suffix: &str) -> Result<V
     if let Some(l) = args.get("limit").and_then(Value::as_i64) {
         pairs.push(("limit".into(), l.clamp(1, 1000).to_string()));
     }
-    let qs = querystring(pairs);
-    let qsr = qs.as_deref();
     let path = format!("/web/api/v2.1/threats/{id}/{suffix}");
-    let path = path.as_str();
+    let (path, pairs, id) = (path.as_str(), &pairs, id.as_str());
     let res = join_all(tenants.into_iter().map(|t| async move {
-        (t.cfg.id.clone(), do_get_json(t, path, qsr).await)
+        // The threat id lives in the *path*, so a site filter in the query
+        // cannot confine this. Prove the threat is in scope first.
+        let out = match verify_targets_in_scope(t, Target::Threat, &[id.to_string()]).await {
+            Err(e) => Err(e),
+            Ok(()) => do_get_json(t, path, pairs).await,
+        };
+        (t.cfg.id.clone(), out)
     }))
     .await;
     Ok(fanout(res))
@@ -335,10 +382,9 @@ async fn list_endpoint(
         }
     }
     merge_filters(args, &mut pairs);
-    let qs = querystring(pairs);
-    let qsr = qs.as_deref();
+    let pairs = &pairs;
     let res = join_all(tenants.into_iter().map(|t| async move {
-        (t.cfg.id.clone(), do_get_json(t, path, qsr).await)
+        (t.cfg.id.clone(), do_get_json(t, path, pairs).await)
     }))
     .await;
     Ok(fanout(res))
@@ -346,14 +392,77 @@ async fn list_endpoint(
 
 async fn get_raw(state: &ServerState, args: &Value) -> Result<Value, String> {
     let path = req_str(args, "path")?;
+    validate_path(&path)?;
     let tenants = state.registry.resolve(str_opt(args, "tenant").as_deref())?;
-    let query = str_opt(args, "query");
-    let (path, query) = (path.as_str(), query.as_deref());
+    let query = str_opt(args, "query").unwrap_or_default();
+    let (path, query) = (path.as_str(), query.as_str());
     let res = join_all(tenants.into_iter().map(|t| async move {
-        (t.cfg.id.clone(), do_get_json(t, path, query).await)
+        let out = match gate_raw_get(t) {
+            Err(e) => Err(e),
+            Ok(()) => match parse_query(query) {
+                Err(e) => Err(e),
+                // Re-serialized through the chokepoint, so the caller's
+                // querystring is subject to the same stripping and intersection
+                // as a curated tool's parameters.
+                Ok(pairs) => do_get_json(t, path, &pairs).await,
+            },
+        };
+        (t.cfg.id.clone(), out)
     }))
     .await;
     Ok(fanout(res))
+}
+
+/// `s1_get_raw` can reach *any* Management path, including ones that do not
+/// implement `siteIds` (e.g. `/sites/{id}`), where forcing the scope into the
+/// query would not confine anything. Refuse it for a confined tenant unless the
+/// operator explicitly accepts that risk.
+fn gate_raw_get(t: &Tenant) -> Result<(), String> {
+    if t.cfg.is_scoped() && !t.cfg.unsafe_allow_raw_get {
+        return Err(format!(
+            "s1_get_raw is disabled for tenant {}: it is confined to sites [{}], and an arbitrary \
+             Management path may ignore the siteIds filter this server injects. Use a curated \
+             s1_* tool, or set S1_TENANT_<ID>_UNSAFE_ALLOW_RAW_GET=true to accept best-effort \
+             scoping.",
+            t.cfg.id,
+            t.cfg.site_ids.join(", "),
+        ));
+    }
+    Ok(())
+}
+
+/// Reject a caller-supplied API path that is not a plain absolute path on the
+/// configured console. The HTTP layer resolves the path with `Url::join`, which
+/// would happily follow an absolute (`https://elsewhere/…`) or protocol-relative
+/// (`//elsewhere/…`) value to another host — sending the tenant's API token
+/// there and escaping confinement entirely.
+fn validate_path(path: &str) -> Result<(), String> {
+    if !path.starts_with('/') || path.starts_with("//") || path.contains("://") {
+        return Err(format!(
+            "invalid API path {path:?}: must be an absolute path on the configured console, \
+             e.g. /web/api/v2.1/agents"
+        ));
+    }
+    Ok(())
+}
+
+/// A caller-supplied value interpolated into a URL path (e.g. the mitigation
+/// action). Must not be able to introduce new path segments.
+fn validate_path_segment(v: &str) -> Result<(), String> {
+    if v.is_empty() || !v.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+        return Err(format!(
+            "invalid path segment {v:?}: expected letters, digits, `-` or `_` only"
+        ));
+    }
+    Ok(())
+}
+
+fn parse_query(q: &str) -> Result<Vec<(String, String)>, String> {
+    if q.is_empty() {
+        return Ok(vec![]);
+    }
+    serde_urlencoded::from_str::<Vec<(String, String)>>(q)
+        .map_err(|e| format!("could not parse `query` as a querystring: {e}"))
 }
 
 // ---- XDR / Data Lake tools (fan-out) ------------------------------------
@@ -430,7 +539,11 @@ async fn run_action(state: &ServerState, args: &Value, act: &ActionTool) -> Resu
     let ids = ids_from_args(args)?;
 
     let path = match act.path_param {
-        Some((arg, _)) => act.path.replace("{action}", &req_str(args, arg)?),
+        Some((arg, _)) => {
+            let seg = req_str(args, arg)?;
+            validate_path_segment(&seg)?;
+            act.path.replace("{action}", &seg)
+        }
         None => act.path.to_string(),
     };
 
@@ -446,6 +559,14 @@ async fn run_action(state: &ServerState, args: &Value, act: &ActionTool) -> Resu
         }
     }
 
+    // Confinement: an action targets entities by id, so the site filter this
+    // server injects into read queries does not reach it. Refuse unless the
+    // body is scope-neutral *and* every target resolves inside our scope.
+    if t.cfg.is_scoped() {
+        enforce_action_body_scope(t, act, &mut data)?;
+        verify_targets_in_scope(t, act.target, &ids).await?;
+    }
+
     let mut body = Map::new();
     body.insert("filter".into(), json!({ "ids": ids }));
     if !data.is_empty() {
@@ -459,11 +580,134 @@ async fn run_action(state: &ServerState, args: &Value, act: &ActionTool) -> Resu
 
 async fn post_raw(state: &ServerState, args: &Value) -> Result<Value, String> {
     let t = gate_single_tenant(state, args)?;
+    if t.cfg.is_scoped() {
+        return Err(format!(
+            "s1_post_raw is refused for tenant {}: it is confined to sites [{}], and an arbitrary \
+             POST body cannot be confined by this server. Use a curated s1_* action tool, which \
+             verifies its targets are in scope.",
+            t.cfg.id,
+            t.cfg.site_ids.join(", "),
+        ));
+    }
     let path = req_str(args, "path")?;
+    validate_path(&path)?;
     let body = args.get("body").cloned().unwrap_or_else(|| json!({}));
     let mgmt = t.client.management().map_err(|e| e.to_string())?;
     let resp = mgmt.post_json(&path, &body).await.map_err(|e| e.to_string())?;
     Ok(json!({ "tenant": t.cfg.id, "path": path, "result": resp }))
+}
+
+/// Reject a mutating body that would set or widen API scope, and validate the
+/// one destination field that legitimately names a site.
+fn enforce_action_body_scope(
+    t: &Tenant,
+    act: &ActionTool,
+    data: &mut Map<String, Value>,
+) -> Result<(), String> {
+    // Destination of a device move: the target site must be one of ours, or the
+    // action would push a device into another customer's site.
+    if let Some(v) = data.get("targetSiteId") {
+        let dest = v.as_str().unwrap_or_default().to_string();
+        if !t.cfg.site_ids.iter().any(|s| *s == dest) {
+            return Err(format!(
+                "refusing to move device(s) to site {dest}: this server is confined to sites [{}]",
+                t.cfg.site_ids.join(", "),
+            ));
+        }
+    }
+
+    // A blocklist entry created at account or global scope would apply to every
+    // customer in the account. Pin it to the agent's own site/group.
+    if act.name == "s1_add_threat_to_blocklist" {
+        let ts = data
+            .get("targetScope")
+            .and_then(Value::as_str)
+            .unwrap_or("site")
+            .to_ascii_lowercase();
+        if ts != "site" && ts != "group" {
+            return Err(format!(
+                "refusing targetScope={ts:?}: a blocklist entry at that scope would apply to every \
+                 customer in this account. Use \"site\" or \"group\"."
+            ));
+        }
+        data.insert("targetScope".into(), Value::String(ts));
+    }
+
+    // Nothing else in the body may name or widen a scope. `targetScope` and
+    // `targetSiteId` are the two fields validated above.
+    let offenders: Vec<String> = data
+        .keys()
+        .filter(|k| {
+            scope::mentions_scope_id(k)
+                && k.as_str() != "targetScope"
+                && k.as_str() != "targetSiteId"
+        })
+        .cloned()
+        .collect();
+    if let Some(k) = offenders.first() {
+        return Err(format!(
+            "refusing action: body field `{k}` sets API scope, which a confined tenant may not do"
+        ));
+    }
+    Ok(())
+}
+
+/// Prove that every target id belongs to this tenant's scope by resolving it
+/// through a *confined* read: the lookup carries our `siteIds`, so an id that
+/// belongs to another customer simply does not come back.
+async fn verify_targets_in_scope(t: &Tenant, target: Target, ids: &[String]) -> Result<(), String> {
+    if !t.cfg.is_scoped() {
+        return Ok(());
+    }
+    let pairs = vec![
+        ("ids".to_string(), ids.join(",")),
+        ("limit".to_string(), ids.len().clamp(1, 1000).to_string()),
+    ];
+    let resp = do_get_json(t, target.list_path(), &pairs).await.map_err(|e| {
+        format!(
+            "refusing: could not verify the {} target(s) are inside this tenant's scope ({e})",
+            target.noun()
+        )
+    })?;
+    let found = ids_in_response(&resp);
+    let missing = scope::unresolved_ids(ids, &found);
+    if !missing.is_empty() {
+        return Err(format!(
+            "refusing: {} id(s) [{}] are not in this tenant's scope (sites [{}])",
+            target.noun(),
+            missing.join(", "),
+            t.cfg.site_ids.join(", "),
+        ));
+    }
+    Ok(())
+}
+
+/// Collect `data[].id` from a Management list envelope.
+fn ids_in_response(v: &Value) -> Vec<String> {
+    v.get("data")
+        .and_then(Value::as_array)
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| d.get("id").and_then(Value::as_str).map(String::from))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// XDR / Data Lake queries are caller-authored PQL / DataSet filter text against
+/// a separate backend; this server has no safe way to rewrite them so they only
+/// touch one site. A confined tenant therefore cannot use them by default.
+fn gate_xdr(t: &Tenant) -> Result<(), String> {
+    if t.cfg.is_scoped() && !t.cfg.unsafe_allow_xdr {
+        return Err(format!(
+            "XDR / Data Lake tools are disabled for tenant {}: it is confined to sites [{}], but \
+             PowerQuery / DataSet query text is caller-authored and this server cannot confine it \
+             to a site. Set S1_TENANT_<ID>_UNSAFE_ALLOW_XDR=true to accept the risk.",
+            t.cfg.id,
+            t.cfg.site_ids.join(", "),
+        ));
+    }
+    Ok(())
 }
 
 fn gate_single_tenant<'a>(state: &'a ServerState, args: &Value) -> Result<&'a Tenant, String> {
@@ -482,22 +726,38 @@ fn gate_single_tenant<'a>(state: &'a ServerState, args: &Value) -> Result<&'a Te
 
 // ---- per-tenant workers --------------------------------------------------
 
+/// Fetch one agent through the *confined* list endpoint (the Management API has
+/// no get-by-id route). Tries `ids` then `uuids`; a device outside this tenant's
+/// scope is simply not found.
 async fn do_get_device(t: &Tenant, id: &str) -> Result<Value, String> {
-    let agent = t.client.agent(id).await.map_err(|e| e.to_string())?;
-    serde_json::to_value(agent.data()).map_err(|e| e.to_string())
+    const AGENTS: &str = "/web/api/v2.1/agents";
+    for key in ["ids", "uuids"] {
+        let pairs = vec![(key.to_string(), id.to_string()), ("limit".to_string(), "1".to_string())];
+        let resp = do_get_json(t, AGENTS, &pairs).await?;
+        if let Some(first) = resp.get("data").and_then(Value::as_array).and_then(|a| a.first()) {
+            return Ok(first.clone());
+        }
+    }
+    Err(format!("agent {id} not found in this tenant's scope"))
 }
 
-async fn do_get_json(t: &Tenant, path: &str, qs: Option<&str>) -> Result<Value, String> {
+/// **The only** Management `GET` in this server. The querystring is produced by
+/// [`scope::apply`], so confinement is applied to every read without each tool
+/// handler having to remember it.
+async fn do_get_json(t: &Tenant, path: &str, pairs: &[(String, String)]) -> Result<Value, String> {
+    let qs = scope::apply(&t.cfg, path, pairs.to_vec())?;
     let mgmt = t.client.management().map_err(|e| e.to_string())?;
-    mgmt.get_json(path, qs).await.map_err(|e| e.to_string())
+    mgmt.get_json(path, qs.as_deref()).await.map_err(|e| e.to_string())
 }
 
 async fn do_power_query(t: &Tenant, pql: &str, from: &str, to: &str) -> Result<Value, String> {
+    gate_xdr(t)?;
     let resp = t.client.power_query(pql).from(from).to(to).run().await.map_err(|e| e.to_string())?;
     Ok(json!({ "columns": resp.columns, "values": resp.values, "matches": resp.matches }))
 }
 
 async fn do_log_query(t: &Tenant, filter: &str, from: &str, to: &str) -> Result<Value, String> {
+    gate_xdr(t)?;
     let xdr = t.client.xdr().map_err(|e| e.to_string())?;
     let resp = xdr.query(filter, from, to).await.map_err(|e| e.to_string())?;
     Ok(json!({
@@ -509,6 +769,7 @@ async fn do_log_query(t: &Tenant, filter: &str, from: &str, to: &str) -> Result<
 }
 
 async fn do_facet(t: &Tenant, filter: &str, field: &str, from: &str, to: &str, max_count: Option<i64>) -> Result<Value, String> {
+    gate_xdr(t)?;
     let xdr = t.client.xdr().map_err(|e| e.to_string())?;
     let mut req = FacetQueryRequest::new(filter, field, from, to);
     if let Some(n) = max_count {
@@ -520,12 +781,14 @@ async fn do_facet(t: &Tenant, filter: &str, field: &str, from: &str, to: &str, m
 }
 
 async fn do_numeric(t: &Tenant, filter: &str, function: &str, from: &str, to: &str) -> Result<Value, String> {
+    gate_xdr(t)?;
     let xdr = t.client.xdr().map_err(|e| e.to_string())?;
     let resp = xdr.numeric_query(filter, function, from, to).await.map_err(|e| e.to_string())?;
     Ok(json!({ "values": resp.values, "warnings": resp.warnings }))
 }
 
 async fn do_timeseries(t: &Tenant, filter: &str, function: &str, from: &str, to: &str, buckets: i64) -> Result<Value, String> {
+    gate_xdr(t)?;
     let xdr = t.client.xdr().map_err(|e| e.to_string())?;
     let spec = TimeseriesQuerySpec::new(filter, function, from, to).buckets(buckets);
     let resp = xdr.timeseries_query(vec![spec]).await.map_err(|e| e.to_string())?;
@@ -534,6 +797,20 @@ async fn do_timeseries(t: &Tenant, filter: &str, function: &str, from: &str, to:
 }
 
 // ---- helpers -------------------------------------------------------------
+
+/// What this tenant is confined to, for `s1_list_tenants` / `s1_ping` so an
+/// agent can see its boundary instead of inferring it from empty results.
+fn scope_report(t: &Tenant) -> Value {
+    json!({
+        "confined": t.cfg.is_scoped(),
+        "site_ids": t.cfg.site_ids,
+        "account_ids": t.cfg.account_ids,
+        "summary": scope::describe(&t.cfg),
+        "xdr_tools": if !t.cfg.is_scoped() || t.cfg.unsafe_allow_xdr { "allowed" } else { "refused (cannot be confined)" },
+        "raw_get": if !t.cfg.is_scoped() || t.cfg.unsafe_allow_raw_get { "allowed" } else { "refused (cannot be confined)" },
+        "raw_post": if t.cfg.is_scoped() { "refused (cannot be confined)" } else { "allowed" },
+    })
+}
 
 fn backends(t: &Tenant) -> Vec<&'static str> {
     let mut b = Vec::new();
@@ -602,13 +879,6 @@ fn value_to_param(v: &Value) -> Option<String> {
     }
 }
 
-fn querystring(pairs: Vec<(String, String)>) -> Option<String> {
-    if pairs.is_empty() {
-        return None;
-    }
-    serde_urlencoded::to_string(&pairs).ok().filter(|s| !s.is_empty())
-}
-
 fn ids_from_args(args: &Value) -> Result<Vec<String>, String> {
     if let Some(id) = str_opt(args, "id") {
         return Ok(vec![id]);
@@ -655,4 +925,187 @@ fn str_array(args: &Value, key: &str) -> Vec<String> {
         .and_then(Value::as_array)
         .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
         .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{Settings, TenantConfig, Transport};
+    use crate::registry::Registry;
+
+    /// A tenant pointed at a port nothing listens on: every check that must
+    /// happen *before* the network is reached is observable, and every check
+    /// that needs the network fails closed (connection refused) rather than
+    /// succeeding unconfined.
+    fn tenant(id: &str, sites: &[&str]) -> TenantConfig {
+        TenantConfig {
+            id: id.into(),
+            name: id.into(),
+            groups: vec![],
+            mgmt_host: Some("http://127.0.0.1:1".into()),
+            mgmt_token: Some("tok".into()),
+            xdr_host: Some("http://127.0.0.1:1".into()),
+            xdr_token: Some("tok".into()),
+            site_ids: sites.iter().map(|s| (*s).to_string()).collect(),
+            account_ids: vec![],
+            unsafe_allow_xdr: false,
+            unsafe_allow_raw_get: false,
+        }
+    }
+
+    fn state(cfg: TenantConfig, allow_actions: bool) -> ServerState {
+        let settings = Settings {
+            transport: Transport::Stdio,
+            bind: "0.0.0.0:0".into(),
+            allow_actions,
+            tenants: vec![cfg],
+        };
+        let registry = Registry::build(&settings).unwrap();
+        ServerState { settings, registry }
+    }
+
+    /// The text of a tools/call result, plus whether it was an error.
+    fn outcome(v: &Value) -> (bool, String) {
+        (
+            v.get("isError").and_then(Value::as_bool).unwrap_or(false),
+            v["content"][0]["text"].as_str().unwrap_or_default().to_string(),
+        )
+    }
+
+    #[tokio::test]
+    async fn scoped_tenant_refuses_post_raw() {
+        let st = state(tenant("acme", &["100"]), true);
+        let r = call(&st, "s1_post_raw", json!({"path": "/web/api/v2.1/agents/actions/disconnect", "body": {}, "confirm": true})).await;
+        let (is_err, text) = outcome(&r);
+        assert!(is_err, "{text}");
+        assert!(text.contains("s1_post_raw is refused"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn unscoped_tenant_still_allows_post_raw() {
+        let st = state(tenant("acme", &[]), true);
+        let r = call(&st, "s1_post_raw", json!({"path": "/web/api/v2.1/x", "body": {}, "confirm": true})).await;
+        let (is_err, text) = outcome(&r);
+        // It fails (nothing is listening) but NOT because of confinement.
+        assert!(is_err);
+        assert!(!text.contains("refused"), "unscoped tenant must be unchanged: {text}");
+    }
+
+    #[tokio::test]
+    async fn scoped_tenant_refuses_raw_get() {
+        let st = state(tenant("acme", &["100"]), false);
+        let r = call(&st, "s1_get_raw", json!({"path": "/web/api/v2.1/sites/999"})).await;
+        let (_, text) = outcome(&r);
+        assert!(text.contains("s1_get_raw is disabled"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn scoped_tenant_refuses_xdr_queries() {
+        let st = state(tenant("acme", &["100"]), false);
+        let r = call(&st, "s1_power_query", json!({"pql": "dataset = 'endpoint' | limit 1"})).await;
+        let (_, text) = outcome(&r);
+        assert!(text.contains("XDR / Data Lake tools are disabled"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn action_moving_a_device_out_of_scope_is_refused() {
+        let st = state(tenant("acme", &["100"]), true);
+        let r = call(
+            &st,
+            "s1_move_device_to_site",
+            json!({"id": "abc", "site_id": "999", "confirm": true}),
+        )
+        .await;
+        let (is_err, text) = outcome(&r);
+        assert!(is_err, "{text}");
+        assert!(text.contains("refusing to move device(s) to site 999"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn action_body_may_not_set_scope() {
+        let st = state(tenant("acme", &["100"]), true);
+        let r = call(
+            &st,
+            "s1_isolate_device",
+            json!({"id": "abc", "data": {"siteIds": "999"}, "confirm": true}),
+        )
+        .await;
+        let (is_err, text) = outcome(&r);
+        assert!(is_err, "{text}");
+        assert!(text.contains("sets API scope"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn action_against_an_unverifiable_target_fails_closed() {
+        let st = state(tenant("acme", &["100"]), true);
+        // The scoped lookup that would prove `abc` is in scope cannot complete,
+        // so the action must be refused rather than attempted.
+        let r = call(&st, "s1_isolate_device", json!({"id": "abc", "confirm": true})).await;
+        let (is_err, text) = outcome(&r);
+        assert!(is_err, "{text}");
+        assert!(text.contains("could not verify the agent target(s)"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn blocklist_at_account_scope_is_refused() {
+        let st = state(tenant("acme", &["100"]), true);
+        let r = call(
+            &st,
+            "s1_add_threat_to_blocklist",
+            json!({"id": "t1", "data": {"targetScope": "account"}, "confirm": true}),
+        )
+        .await;
+        let (_, text) = outcome(&r);
+        assert!(text.contains("refusing targetScope"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn raw_tools_cannot_be_pointed_at_another_host() {
+        let st = state(tenant("acme", &[]), true);
+        for bad in ["https://evil.example/x", "//evil.example/x", "web/api/v2.1/agents"] {
+            let r = call(&st, "s1_get_raw", json!({ "path": bad })).await;
+            let (is_err, text) = outcome(&r);
+            assert!(is_err && text.contains("invalid API path"), "{bad}: {text}");
+            let r = call(&st, "s1_post_raw", json!({ "path": bad, "confirm": true })).await;
+            let (is_err, text) = outcome(&r);
+            assert!(is_err && text.contains("invalid API path"), "{bad}: {text}");
+        }
+    }
+
+    #[tokio::test]
+    async fn action_path_segment_cannot_add_segments() {
+        let st = state(tenant("acme", &[]), true);
+        let r = call(
+            &st,
+            "s1_mitigate_threat",
+            json!({"id": "t1", "action": "../../../web/api/v2.1/users", "confirm": true}),
+        )
+        .await;
+        let (is_err, text) = outcome(&r);
+        assert!(is_err, "{text}");
+        assert!(text.contains("invalid path segment"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn list_tenants_reports_the_confinement() {
+        let st = state(tenant("acme", &["100", "200"]), false);
+        let r = call(&st, "s1_list_tenants", json!({})).await;
+        let (_, text) = outcome(&r);
+        let v: Value = serde_json::from_str(&text).unwrap();
+        let sc = &v["tenants"][0]["scope"];
+        assert_eq!(sc["confined"], json!(true));
+        assert_eq!(sc["site_ids"], json!(["100", "200"]));
+        assert!(sc["summary"].as_str().unwrap().contains("2 site(s)"));
+        assert!(sc["raw_post"].as_str().unwrap().starts_with("refused"));
+    }
+
+    #[tokio::test]
+    async fn unscoped_tenant_reports_no_confinement() {
+        let st = state(tenant("acme", &[]), false);
+        let r = call(&st, "s1_ping", json!({})).await;
+        let (_, text) = outcome(&r);
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["results"][0]["scope"]["confined"], json!(false));
+        assert_eq!(v["results"][0]["scope"]["raw_post"], json!("allowed"));
+    }
 }
