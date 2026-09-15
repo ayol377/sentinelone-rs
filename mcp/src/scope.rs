@@ -107,6 +107,11 @@ pub fn policy(cfg: &TenantConfig, path: &str) -> PathPolicy {
     if p.ends_with("/activities/types") {
         return PathPolicy::NoCustomerData;
     }
+    // Polling a PowerQuery by id: scope was fixed (and confined) when the query
+    // was created via POST /dv/events/pq; the ping takes only `queryId`.
+    if p.ends_with("/dv/events/pq-ping") {
+        return PathPolicy::NoCustomerData;
+    }
     // /accounts takes `accountIds` but not `siteIds`; a site-scoped tenant
     // cannot confine it, so it is refused unless account ids are configured.
     if p.ends_with("/accounts") || p.contains("/accounts/") {
@@ -125,7 +130,7 @@ pub fn policy(cfg: &TenantConfig, path: &str) -> PathPolicy {
 /// it. A disjoint request is an error naming the allowed ids, so the caller
 /// learns it asked outside its scope instead of silently receiving everything
 /// in scope (which would read as "that customer has no such data").
-fn intersect(requested: &[String], allowed: &[String], what: &str) -> Result<Vec<String>, String> {
+pub(crate) fn intersect(requested: &[String], allowed: &[String], what: &str) -> Result<Vec<String>, String> {
     if requested.is_empty() {
         return Ok(allowed.to_vec());
     }

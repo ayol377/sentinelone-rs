@@ -195,7 +195,7 @@ segments.
   confined and unconfined tenants' results in one response, each tagged with its
   `tenant`.
 
-## Tools (42)
+## Tools (43)
 
 Every read tool takes the common params `tenant`, `query`, `limit`, `cursor`,
 `sort_by`, `sort_order`, and a **`filters`** object accepting any API query param
@@ -233,7 +233,8 @@ to the convenience aliases below.
 **Hunting (XDR / Data Lake)**
 | Tool | Purpose |
 |------|---------|
-| `s1_power_query` | arbitrary PQL hunt |
+| `s1_dv_power_query` | PQL via the Management console (`/dv/events/pq`); honours multi-account tokens, optional `account_ids`/`site_ids`. **Use this on multi-account consoles** |
+| `s1_power_query` | PQL via the XDR host. Fast, but on a multi-account console it can return zero rows with no error |
 | `s1_query` | DataSet log/event filter query |
 | `s1_facet`, `s1_numeric`, `s1_timeseries` | aggregate / trend / spike |
 

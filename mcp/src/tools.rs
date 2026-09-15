@@ -156,8 +156,8 @@ const ACTION_TOOLS: &[ActionTool] = &[
 
 /// JSON-Schema tool definitions returned by `tools/list`.
 pub fn definitions() -> Vec<Value> {
-    let from_p = json!({ "type": "string", "description": "Window start (DataSet time: \"24 hours\", RFC3339, epoch ns). Default \"24 hours\"." });
-    let to_p = json!({ "type": "string", "description": "Window end. Default \"now\"." });
+    let from_p = json!({ "type": "string", "description": "Window start: relative like \"24h\" / \"7d\", RFC3339, or epoch ms. Default \"24h\"." });
+    let to_p = json!({ "type": "string", "description": "Window end: RFC3339 or epoch ms (\"now\" is NOT accepted by the XDR host). Default: current time." });
     let tenant_p = json!({ "type": "string", "description": TENANT_HELP });
 
     let mut tools = vec![
@@ -176,8 +176,16 @@ pub fn definitions() -> Vec<Value> {
         json!({ "name": "s1_threat_notes", "description": "Notes attached to a threat.",
                 "inputSchema": threat_sub_schema() }),
         // ---- XDR / Data Lake hunting ----
-        json!({ "name": "s1_power_query", "description": "Run a PowerQuery (PQL) against the XDR / Data Lake. Returns columns + rows. Fan-out capable.",
+        json!({ "name": "s1_power_query", "description": "Run a PowerQuery (PQL) against the XDR / Data Lake host. Returns columns + rows. Fan-out capable. NOTE: on a multi-account console this host can return zero rows with no error; prefer s1_dv_power_query there.",
                 "inputSchema": { "type": "object", "properties": { "tenant": tenant_p, "pql": { "type": "string", "description": "PowerQuery text." }, "from": from_p, "to": to_p }, "required": ["pql"], "additionalProperties": false } }),
+        json!({ "name": "s1_dv_power_query", "description": "Run a PowerQuery (PQL) through the Management console (POST /dv/events/pq + pq-ping) instead of the XDR host. Same ApiToken as every other tool; honours the token's multi-account scope and takes optional account_ids / site_ids. Preferred over s1_power_query on multi-account consoles. Polls up to ~2 min. Fan-out capable.",
+                "inputSchema": { "type": "object", "properties": { "tenant": tenant_p, "pql": { "type": "string", "description": "PowerQuery text." },
+                    "from": { "type": "string", "description": "RFC3339 start, e.g. 2026-09-14T00:00:00Z (required; DataSet relative syntax is NOT accepted here)." },
+                    "to": { "type": "string", "description": "RFC3339 end." },
+                    "account_ids": { "type": "array", "items": { "type": "string" }, "description": "Account id(s) to scope to." },
+                    "site_ids": { "type": "array", "items": { "type": "string" }, "description": "Site id(s) to scope to." },
+                    "limit": { "type": "integer", "description": "Max rows (1-100000). Default 1000." } },
+                  "required": ["pql", "from", "to"], "additionalProperties": false } }),
         json!({ "name": "s1_query", "description": "Run a DataSet log/event query (filter expression). Returns matching events.",
                 "inputSchema": { "type": "object", "properties": { "tenant": tenant_p, "filter": { "type": "string", "description": "DataSet filter expression. Empty = all events." }, "from": from_p, "to": to_p, "limit": { "type": "integer", "description": "Max events." } }, "additionalProperties": false } }),
         json!({ "name": "s1_facet", "description": "Top values of a field over XDR events (group-by + count). Fan-out capable.",
@@ -266,6 +274,8 @@ pub async fn call(state: &ServerState, name: &str, args: Value) -> Value {
         threat_sub(state, &args, "notes").await
     } else if name == "s1_power_query" {
         power_query(state, &args).await
+    } else if name == "s1_dv_power_query" {
+        dv_power_query(state, &args).await
     } else if name == "s1_query" {
         log_query(state, &args).await
     } else if name == "s1_facet" {
@@ -474,6 +484,22 @@ async fn power_query(state: &ServerState, args: &Value) -> Result<Value, String>
     let (pql, from, to) = (pql.as_str(), from.as_str(), to.as_str());
     let res = join_all(tenants.into_iter().map(|t| async move {
         (t.cfg.id.clone(), do_power_query(t, pql, from, to).await)
+    }))
+    .await;
+    Ok(fanout(res))
+}
+
+async fn dv_power_query(state: &ServerState, args: &Value) -> Result<Value, String> {
+    let pql = req_str(args, "pql")?;
+    let from = req_str(args, "from")?;
+    let to = req_str(args, "to")?;
+    let limit = args.get("limit").and_then(Value::as_i64).unwrap_or(1000).clamp(1, 100_000);
+    let accounts = str_array(args, "account_ids");
+    let sites = str_array(args, "site_ids");
+    let tenants = state.registry.resolve(str_opt(args, "tenant").as_deref())?;
+    let (pql, from, to, accounts, sites) = (pql.as_str(), from.as_str(), to.as_str(), &accounts, &sites);
+    let res = join_all(tenants.into_iter().map(|t| async move {
+        (t.cfg.id.clone(), do_dv_power_query(t, pql, from, to, limit, accounts, sites).await)
     }))
     .await;
     Ok(fanout(res))
@@ -756,6 +782,52 @@ async fn do_power_query(t: &Tenant, pql: &str, from: &str, to: &str) -> Result<V
     Ok(json!({ "columns": resp.columns, "values": resp.values, "matches": resp.matches }))
 }
 
+/// PowerQuery via the Management console (`/dv/events/pq`), polled to
+/// completion. Scope lives in the JSON body rather than a querystring, so
+/// confinement is applied here with the same intersection rule `scope::apply`
+/// uses: a confined tenant's allow-list wins, an unconfined one passes the
+/// caller's ids through.
+async fn do_dv_power_query(
+    t: &Tenant,
+    pql: &str,
+    from: &str,
+    to: &str,
+    limit: i64,
+    account_ids: &[String],
+    site_ids: &[String],
+) -> Result<Value, String> {
+    let cfg = &t.cfg;
+    let mut body = json!({ "query": pql, "fromDate": from, "toDate": to, "limit": limit });
+    let (accounts, sites) = if cfg.is_scoped() {
+        (
+            if cfg.account_ids.is_empty() { vec![] } else { scope::intersect(account_ids, &cfg.account_ids, "accounts")? },
+            if cfg.site_ids.is_empty() { vec![] } else { scope::intersect(site_ids, &cfg.site_ids, "sites")? },
+        )
+    } else {
+        (account_ids.to_vec(), site_ids.to_vec())
+    };
+    if !accounts.is_empty() {
+        body["accountIds"] = json!(accounts);
+    }
+    if !sites.is_empty() {
+        body["siteIds"] = json!(sites);
+    }
+    let mgmt = t.client.management().map_err(|e| e.to_string())?;
+    let mut resp = mgmt.post_json("/web/api/v2.1/dv/events/pq", &body).await.map_err(|e| e.to_string())?;
+    // ponytail: fixed 2s poll, 60 tries (~2 min); make it configurable if analysts hit the ceiling.
+    for _ in 0..60 {
+        let status = resp["data"]["status"].as_str().unwrap_or("").to_ascii_uppercase();
+        if status != "RUNNING" {
+            break;
+        }
+        let Some(qid) = resp["data"]["queryId"].as_str().map(String::from) else { break };
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+        let qs = scope::apply(cfg, "/web/api/v2.1/dv/events/pq-ping", vec![("queryId".into(), qid)])?;
+        resp = mgmt.get_json("/web/api/v2.1/dv/events/pq-ping", qs.as_deref()).await.map_err(|e| e.to_string())?;
+    }
+    Ok(json!({ "scope_sent": { "accountIds": accounts, "siteIds": sites }, "result": resp["data"] }))
+}
+
 async fn do_log_query(t: &Tenant, filter: &str, from: &str, to: &str) -> Result<Value, String> {
     gate_xdr(t)?;
     let xdr = t.client.xdr().map_err(|e| e.to_string())?;
@@ -823,10 +895,17 @@ fn backends(t: &Tenant) -> Vec<&'static str> {
     b
 }
 
+/// XDR-host time window. S1's XDR host rejects DataSet's `now` ("Can't parse
+/// date [now]") but accepts `24h`-style relative starts, RFC3339, and epoch ms,
+/// so the default end is the current time as epoch milliseconds.
 fn window(args: &Value) -> (String, String) {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis().to_string())
+        .unwrap_or_default();
     (
-        str_opt(args, "from").unwrap_or_else(|| "24 hours".into()),
-        str_opt(args, "to").unwrap_or_else(|| "now".into()),
+        str_opt(args, "from").unwrap_or_else(|| "24h".into()),
+        str_opt(args, "to").unwrap_or(now_ms),
     )
 }
 
